@@ -16,6 +16,8 @@ import { buildStreamUrl, clip, pickVideoFile, resolveArchiveItem, stripHtml } fr
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = resolve(ROOT, 'server/data/movies.json');
 const CONCURRENCY = 6;
+/** Features only: anything smaller than this is almost always a trailer or clip. */
+const MIN_FEATURE_BYTES = 60 * 1024 * 1024;
 
 /** Curated freely available titles, with the genres and hook we present. */
 const CURATED = [
@@ -97,12 +99,12 @@ async function resolveTitle(entry) {
     try {
       const meta = await getJson(`https://archive.org/metadata/${doc.identifier}`);
       if (!meta || meta.is_dark) continue;
-      const video = pickVideoFile(meta.files);
+      const video = pickVideoFile(meta.files, { minSizeBytes: MIN_FEATURE_BYTES });
       if (!video) continue;
       const streamUrl = buildStreamUrl(doc.identifier, video.name);
       if (!(await headOk(streamUrl))) continue;
 
-      const item = await resolveArchiveItem(doc.identifier);
+      const item = await resolveArchiveItem(doc.identifier, { minSizeBytes: MIN_FEATURE_BYTES });
       return {
         ...item,
         id: entry.slug,

@@ -35,7 +35,7 @@ export function clip(text, max) {
   return `${cut.slice(0, stop > max * 0.6 ? stop : max).trim()}…`;
 }
 
-export function pickVideoFile(files) {
+export function pickVideoFile(files, { minSizeBytes = 8 * 1024 * 1024 } = {}) {
   return (
     (files || [])
       .filter((file) => file && typeof file.name === 'string')
@@ -44,7 +44,7 @@ export function pickVideoFile(files) {
         (file) =>
           VIDEO_FORMATS.test(String(file.format || '').trim()) || /\.(mp4|m4v|webm)$/i.test(file.name),
       )
-      .filter((file) => Number(file.size || 0) > 8 * 1024 * 1024)
+      .filter((file) => Number(file.size || 0) > minSizeBytes)
       .sort((a, b) => Number(b.size || 0) - Number(a.size || 0))[0] ?? null
   );
 }
@@ -130,15 +130,15 @@ export async function searchArchive({ query, collection, sort = 'downloads desc'
 }
 
 /** Resolve one Archive identifier into a playable movie record. */
-export async function resolveArchiveItem(identifier) {
-  const key = `item:${identifier}`;
+export async function resolveArchiveItem(identifier, { minSizeBytes } = {}) {
+  const key = `item:${identifier}:${minSizeBytes ?? 'any'}`;
   const cached = recall(key);
   if (cached) return cached;
 
   const meta = await getJson(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, 15000);
   if (!meta || meta.is_dark) throw new Error('This item is not publicly available');
 
-  const video = pickVideoFile(meta.files);
+  const video = pickVideoFile(meta.files, minSizeBytes ? { minSizeBytes } : undefined);
   if (!video) throw new Error('No playable video file for this item');
 
   const metadata = meta.metadata ?? {};
