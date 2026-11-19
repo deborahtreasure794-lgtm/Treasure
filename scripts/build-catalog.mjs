@@ -3,21 +3,21 @@
  * Builds server/data/movies.json from the Internet Archive.
  *
  * For every curated title we search the Archive, pick an item that exposes a
- * real, publicly downloadable video derivative, verify the URL responds with a
- * video payload, then store the resolved stream URL plus metadata.
+ * real, downloadable video derivative, verify the URL actually serves video,
+ * then store the resolved stream URL plus metadata.
  *
  * Usage: npm run catalog
  */
-import { writeFile, mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildStreamUrl, clip, pickVideoFile, resolveArchiveItem, stripHtml } from '../server/archive.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = resolve(ROOT, 'server/data/movies.json');
 const CONCURRENCY = 6;
-const UA = 'OpenReelCatalog/1.0 (+https://appjet.dev)';
 
-/** Curated public-domain / freely available titles. */
+/** Curated freely available titles, with the genres and hook we present. */
 const CURATED = [
   { slug: 'nosferatu', title: 'Nosferatu', year: 1922, genres: ['Horror', 'Silent', 'Fantasy'], tagline: 'The vampire film that still casts a shadow over every horror movie since.' },
   { slug: 'metropolis', title: 'Metropolis', year: 1927, genres: ['Sci-Fi', 'Silent', 'Drama'], tagline: 'A future city of towers and machines, and the uprising that shakes it.', featured: true },
@@ -32,7 +32,7 @@ const CURATED = [
   { slug: 'detour', title: 'Detour', year: 1945, genres: ['Noir', 'Crime', 'Drama'], tagline: 'Hitchhiking to Los Angeles was the worst decision he ever made.' },
   { slug: 'd-o-a', title: 'D.O.A.', year: 1949, genres: ['Noir', 'Crime', 'Mystery'], tagline: 'He has hours to live and one question: who poisoned him?' },
   { slug: 'the-stranger', title: 'The Stranger', year: 1946, genres: ['Noir', 'Thriller'], tagline: 'A quiet professor in a small town, and the war crime he buried.' },
-  { slug: 'meet-john-doe', title: 'Meet John Doe', year: 1941, genres: ['Drama', 'Romance'], tagline: 'A columnist invents a everyman, and the country believes in him.' },
+  { slug: 'meet-john-doe', title: 'Meet John Doe', year: 1941, genres: ['Drama', 'Romance'], tagline: 'A columnist invents an everyman, and the whole country believes in him.' },
   { slug: 'its-a-wonderful-life', title: "It's a Wonderful Life", year: 1946, genres: ['Drama', 'Family', 'Fantasy'], tagline: 'A man at the end of his rope gets to see the town that never knew him.' },
   { slug: 'a-trip-to-the-moon', title: 'A Trip to the Moon', year: 1902, genres: ['Sci-Fi', 'Silent', 'Short'], tagline: 'Fifteen minutes that invented the science fiction film.' },
   { slug: 'the-phantom-of-the-opera', title: 'The Phantom of the Opera', year: 1925, genres: ['Horror', 'Silent', 'Drama'], tagline: 'A masked figure beneath the opera house, and the soprano he adores.' },
@@ -56,45 +56,19 @@ const CURATED = [
   { slug: 'the-amazing-mr-x', title: 'The Amazing Mr. X', year: 1948, genres: ['Noir', 'Mystery'], tagline: 'A phony spiritualist finds a widow whose ghosts may be real.' },
 ];
 
-const VIDEO_FORMATS = /^(h\.264|h\.264 ia|mpeg4|512kb mpeg4|mpeg2|ogg video|matroska|windows media|divx|quicktime)$/i;
-
-function stripHtml(input) {
-  if (!input) return '';
-  const text = Array.isArray(input) ? input.join(' ') : String(input);
-  return text
-    .replace(/<br\s*\/?>/gi, ' ')
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#0?39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function clip(text, max) {
-  if (text.length <= max) return text;
-  const cut = text.slice(0, max);
-  const stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf(' '));
-  return `${cut.slice(0, stop > max * 0.6 ? stop : max).trim()}…`;
-}
-
 async function getJson(url, timeoutMs = 20000) {
-  const res = await fetch(url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(timeoutMs) });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  const res = await fetch(url, {
+    headers: { 'user-agent': 'OpenReel/1.0 (+https://appjet.dev)' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-async function searchArchive(title, year) {
+async function searchCandidates(title, year) {
   const params = new URLSearchParams();
-  params.set('q', `title:("${title}") AND mediatype:movies AND year:[${year - 1} TO ${year + 1}]`);
-  params.append('fl[]', 'identifier');
-  params.append('fl[]', 'title');
-  params.append('fl[]', 'year');
-  params.append('fl[]', 'downloads');
+  params.set('q', `title:("${title.replace(/["\\]/g, ' ')}") AND mediatype:movies AND year:[${year - 1} TO ${year + 1}]`);
+  for (const field of ['identifier', 'title', 'year', 'downloads']) params.append('fl[]', field);
   params.append('sort[]', 'downloads desc');
   params.set('rows', '10');
   params.set('output', 'json');
@@ -102,26 +76,16 @@ async function searchArchive(title, year) {
   return data?.response?.docs ?? [];
 }
 
-function pickVideo(files) {
-  const candidates = (files || [])
-    .filter((f) => f && typeof f.name === 'string')
-    .filter((f) => /\.(mp4|m4v|ogv|webm)$/i.test(f.name))
-    .filter((f) => VIDEO_FORMATS.test(String(f.format || '').trim()) || /\.(mp4|m4v|webm)$/i.test(f.name))
-    .filter((f) => Number(f.size || 0) > 8 * 1024 * 1024)
-    .sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
-  return candidates[0] ?? null;
-}
-
 async function headOk(url) {
   try {
     const res = await fetch(url, {
       method: 'GET',
-      headers: { 'user-agent': UA, range: 'bytes=0-1023' },
+      headers: { 'user-agent': 'OpenReel/1.0', range: 'bytes=0-1023' },
       redirect: 'follow',
       signal: AbortSignal.timeout(20000),
     });
     const type = res.headers.get('content-type') || '';
-    res.body?.cancel?.();
+    await res.body?.cancel?.();
     return res.ok && !type.includes('text/html');
   } catch {
     return false;
@@ -129,39 +93,26 @@ async function headOk(url) {
 }
 
 async function resolveTitle(entry) {
-  const docs = await searchArchive(entry.title, entry.year);
-  for (const doc of docs) {
+  for (const doc of await searchCandidates(entry.title, entry.year)) {
     try {
       const meta = await getJson(`https://archive.org/metadata/${doc.identifier}`);
       if (!meta || meta.is_dark) continue;
-      const video = pickVideo(meta.files);
+      const video = pickVideoFile(meta.files);
       if (!video) continue;
-      const streamUrl = `https://archive.org/download/${doc.identifier}/${video.name
-        .split('/')
-        .map(encodeURIComponent)
-        .join('/')}`;
+      const streamUrl = buildStreamUrl(doc.identifier, video.name);
       if (!(await headOk(streamUrl))) continue;
 
-      const runtimeSeconds = Number(video.length || 0) || null;
-      const description = stripHtml(meta.metadata?.description);
+      const item = await resolveArchiveItem(doc.identifier);
       return {
+        ...item,
         id: entry.slug,
-        title: stripHtml(meta.metadata?.title) || entry.title,
-        year: Number(meta.metadata?.year || entry.year) || entry.year,
+        title: entry.title,
+        year: entry.year,
         genres: entry.genres,
         tagline: entry.tagline,
-        synopsis: clip(description, 700) || entry.tagline,
-        director: stripHtml(meta.metadata?.director) || null,
-        cast: stripHtml(meta.metadata?.creator) || null,
-        rating: Number(meta.metadata?.avg_rating || 0) || null,
-        runtimeMinutes: runtimeSeconds ? Math.round(runtimeSeconds / 60) : null,
-        poster: `https://archive.org/services/img/${doc.identifier}`,
-        streamUrl,
-        source: 'Internet Archive',
-        archiveIdentifier: doc.identifier,
-        archivePage: `https://archive.org/details/${doc.identifier}`,
-        sizeBytes: Number(video.size || 0) || null,
+        synopsis: clip(stripHtml(meta.metadata?.description), 700) || entry.tagline,
         featured: Boolean(entry.featured),
+        streamUrl,
       };
     } catch {
       /* try the next candidate */
@@ -173,13 +124,14 @@ async function resolveTitle(entry) {
 async function mapLimit(items, limit, worker) {
   const results = new Array(items.length);
   let cursor = 0;
-  async function run() {
-    while (cursor < items.length) {
-      const index = cursor++;
-      results[index] = await worker(items[index], index);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (cursor < items.length) {
+        const index = cursor++;
+        results[index] = await worker(items[index]);
+      }
+    }),
+  );
   return results;
 }
 
@@ -189,7 +141,7 @@ async function main() {
     try {
       const movie = await resolveTitle(entry);
       if (movie) {
-        console.log(`  ok    ${entry.title} (${entry.year}) -> ${movie.archiveIdentifier} [${Math.round((movie.sizeBytes || 0) / 1048576)}MB]`);
+        console.log(`  ok    ${entry.title} (${entry.year}) -> ${movie.identifier} [${Math.round((movie.sizeBytes || 0) / 1048576)}MB]`);
       } else {
         console.warn(`  MISS  ${entry.title} (${entry.year})`);
       }
@@ -200,15 +152,11 @@ async function main() {
     }
   });
 
-  const movies = resolved.filter(Boolean);
-  if (movies.length < 8) throw new Error(`Only ${movies.length} titles resolved, refusing to overwrite catalog`);
+  const movies = resolved.filter(Boolean).sort((a, b) => a.title.localeCompare(b.title));
+  if (movies.length < 8) throw new Error(`Only ${movies.length} titles resolved — refusing to overwrite catalog`);
 
-  movies.sort((a, b) => a.title.localeCompare(b.title));
   await mkdir(dirname(OUT), { recursive: true });
-  await writeFile(
-    OUT,
-    `${JSON.stringify({ generatedAt: new Date().toISOString(), source: 'Internet Archive', movies }, null, 2)}\n`,
-  );
+  await writeFile(OUT, `${JSON.stringify({ generatedAt: new Date().toISOString(), source: 'Internet Archive', movies }, null, 2)}\n`);
   console.log(`\nWrote ${movies.length}/${CURATED.length} movies to ${OUT}`);
 }
 
